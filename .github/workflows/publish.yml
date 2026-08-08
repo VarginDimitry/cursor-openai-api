@@ -2,47 +2,45 @@ name: Publish Docker Image
 
 on:
   push:
-    tags:
-      - "v*"
-  workflow_dispatch:
+    branches:
+      - main
 
 jobs:
   publish:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
 
     steps:
       - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Install Bun
-        uses: oven-sh/setup-bun@v2
-
-      - name: Install dependencies
-        run: bun install
-
-      - name: Build
-        run: bun run build
+      - name: Allow insecure HTTP registry
+        run: |
+          echo '{"insecure-registries":["${{ secrets.REGISTRY_HOST }}"]}' | sudo tee /etc/docker/daemon.json
+          sudo systemctl restart docker
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
+        with:
+          driver-opts: network=host
+          buildkitd-config-inline: |
+            [registry."${{ secrets.REGISTRY_HOST }}"]
+              http = true
+              insecure = true
 
-      - name: Log in to GitHub Container Registry
+      - name: Log in to container registry
         uses: docker/login-action@v4
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          registry: ${{ secrets.REGISTRY_HOST }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
 
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v6
         with:
-          images: ghcr.io/${{ github.repository }}
+          images: ${{ secrets.REGISTRY_HOST }}/common/cursor-openai-api
           tags: |
-            type=semver,pattern={{version}}
+            type=raw,value=latest
             type=sha,prefix=
 
       - name: Build and push
