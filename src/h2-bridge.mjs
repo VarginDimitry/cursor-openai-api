@@ -10,7 +10,8 @@
  *   [4 bytes big-endian length][payload]
  *
  * First message on stdin is JSON config:
- *   { "accessToken": "...", "url": "...", "path": "..." }
+ *   { "accessToken": "...", "url": "...", "path": "...",
+ *     "clientVersion": "...", "contentType": "application/connect+proto" }
  *
  * After config, subsequent stdin messages are raw bytes to write to the H2 stream.
  * H2 response data is written to stdout using the same length-prefixed framing.
@@ -18,7 +19,8 @@
 import http2 from "node:http2";
 import crypto from "node:crypto";
 
-const CURSOR_CLIENT_VERSION = "cli-2026.01.09-231024f";
+const DEFAULT_CLIENT_VERSION = "cli-2026.02.13-41ac335";
+const DEFAULT_CONTENT_TYPE = "application/connect+proto";
 
 /** Write one length-prefixed message to stdout. */
 function writeMessage(data) {
@@ -80,7 +82,9 @@ const configBuf = await readMessage();
 if (!configBuf) process.exit(1);
 
 const config = JSON.parse(configBuf.toString("utf8"));
-const { accessToken, url, path: rpcPath } = config;
+const { accessToken, url, path: rpcPath, clientVersion, contentType } = config;
+const resolvedContentType = contentType || DEFAULT_CONTENT_TYPE;
+const useConnect = resolvedContentType.includes("connect");
 
 const client = http2.connect(url || "https://api2.cursor.sh");
 
@@ -94,18 +98,22 @@ client.on("error", () => {
   process.exit(1);
 });
 
-const h2Stream = client.request({
+const headers = {
   ":method": "POST",
   ":path": rpcPath || "/agent.v1.AgentService/Run",
-  "content-type": "application/connect+proto",
-  "connect-protocol-version": "1",
+  "content-type": resolvedContentType,
   te: "trailers",
   authorization: `Bearer ${accessToken}`,
   "x-ghost-mode": "true",
-  "x-cursor-client-version": CURSOR_CLIENT_VERSION,
+  "x-cursor-client-version": clientVersion || DEFAULT_CLIENT_VERSION,
   "x-cursor-client-type": "cli",
   "x-request-id": crypto.randomUUID(),
-});
+};
+if (useConnect) {
+  headers["connect-protocol-version"] = "1";
+}
+
+const h2Stream = client.request(headers);
 
 // Forward H2 response data → stdout (length-prefixed)
 h2Stream.on("data", (chunk) => {
@@ -130,7 +138,10 @@ h2Stream.on("error", () => {
   while (true) {
     const msg = await readMessage();
     if (!msg || msg.length === 0) {
-      // EOF or zero-length = done writing
+      // EOF or zero-length = half-close the request (needed for unary RPCs)
+      if (!h2Stream.closed && !h2Stream.destroyed) {
+        h2Stream.end();
+      }
       break;
     }
     if (!h2Stream.closed && !h2Stream.destroyed) {

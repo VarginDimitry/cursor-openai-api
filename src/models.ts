@@ -1,12 +1,10 @@
 /**
  * Cursor model discovery via GetUsableModels gRPC endpoint.
- * Uses curl for HTTP/2 transport (Bun's node:http2 is broken).
+ * Uses the Node h2-bridge for HTTP/2 transport (Bun's node:http2 is broken;
+ * shelling out to curl fails in Docker Alpine where curl is absent).
  * Falls back to a hardcoded list if the endpoint is unreachable.
  */
-import { execSync } from "node:child_process";
-import { writeFileSync, readFileSync, unlinkSync, existsSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { resolve as pathResolve } from "node:path";
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { z } from "zod";
 import {
@@ -17,6 +15,7 @@ import {
 const CURSOR_BASE_URL = "https://api2.cursor.sh";
 const CURSOR_CLIENT_VERSION = "cli-2026.02.13-41ac335";
 const GET_USABLE_MODELS_PATH = "/agent.v1.AgentService/GetUsableModels";
+const BRIDGE_PATH = pathResolve(import.meta.dir, "h2-bridge.mjs");
 
 const DEFAULT_CONTEXT_WINDOW = 200_000;
 const DEFAULT_MAX_TOKENS = 64_000;
@@ -112,24 +111,16 @@ export async function getCursorModels(
 
 // --- Internal helpers ---
 
-function buildRequestHeaders(
-  options: CursorModelDiscoveryOptions,
-): Record<string, string> {
-  return {
-    "content-type": "application/proto",
-    te: "trailers",
-    authorization: `Bearer ${options.apiKey}`,
-    "x-ghost-mode": "true",
-    "x-cursor-client-version":
-      options.clientVersion ?? CURSOR_CLIENT_VERSION,
-    "x-cursor-client-type": "cli",
-  };
+/** Length-prefix a message: [4-byte BE length][payload] */
+function lpEncode(data: Uint8Array): Buffer {
+  const buf = Buffer.alloc(4 + data.length);
+  buf.writeUInt32BE(data.length, 0);
+  buf.set(data, 4);
+  return buf;
 }
 
-
 /**
- * HTTP/2 transport via curl (Bun's node:http2 doesn't work with Cursor's API).
- * Writes request body to a temp file, invokes curl --http2, reads response.
+ * Unary GetUsableModels via the Node HTTP/2 bridge (same transport as chat).
  */
 async function fetchViaHttp2(
   baseUrl: string,
@@ -137,37 +128,65 @@ async function fetchViaHttp2(
   options: CursorModelDiscoveryOptions,
   timeoutMs: number,
 ): Promise<Uint8Array | null> {
-  const reqPath = join(tmpdir(), `cursor-req-${Date.now()}.bin`);
-  const respPath = join(tmpdir(), `cursor-resp-${Date.now()}.bin`);
   try {
-    writeFileSync(reqPath, body);
-    const headers = buildRequestHeaders(options);
-    const headerArgs = Object.entries(headers)
-      .flatMap(([k, v]) => ["-H", `${k}: ${v}`]);
-    const timeoutSecs = Math.ceil(timeoutMs / 1000);
-    const url = `${baseUrl}${GET_USABLE_MODELS_PATH}`;
-    const args = [
-      "curl", "-s", "--http2",
-      "--max-time", String(timeoutSecs),
-      "-X", "POST",
-      ...headerArgs,
-      "--data-binary", `@${reqPath}`,
-      "-o", respPath,
-      "-w", "%{http_code}",
-      url,
-    ];
-    const status = execSync(args.map(a => a.includes(' ') ? `"${a}"` : a).join(' '), {
-      timeout: timeoutMs + 2000,
-      stdio: ["pipe", "pipe", "pipe"],
-    }).toString().trim();
-    if (!status.startsWith("2")) return null;
-    if (!existsSync(respPath)) return null;
-    return new Uint8Array(readFileSync(respPath));
+    const proc = Bun.spawn(["node", BRIDGE_PATH], {
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "ignore",
+    });
+
+    // GetUsableModels expects raw application/proto (not Connect framing).
+    const config = JSON.stringify({
+      accessToken: options.apiKey,
+      url: baseUrl,
+      path: GET_USABLE_MODELS_PATH,
+      clientVersion: options.clientVersion ?? CURSOR_CLIENT_VERSION,
+      contentType: "application/proto",
+    });
+
+    proc.stdin.write(lpEncode(new TextEncoder().encode(config)));
+    proc.stdin.write(lpEncode(body));
+    proc.stdin.write(lpEncode(new Uint8Array(0)));
+    proc.stdin.end();
+
+    const chunks: Buffer[] = [];
+    const reader = proc.stdout.getReader();
+    let pending = Buffer.alloc(0);
+
+    const readAll = (async () => {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        pending = Buffer.concat([pending, Buffer.from(value)]);
+        while (pending.length >= 4) {
+          const len = pending.readUInt32BE(0);
+          if (pending.length < 4 + len) break;
+          chunks.push(Buffer.from(pending.subarray(4, 4 + len)));
+          pending = pending.subarray(4 + len);
+        }
+      }
+    })();
+
+    const timedOut = await Promise.race([
+      readAll.then(() => false),
+      new Promise<boolean>((resolve) =>
+        setTimeout(() => resolve(true), timeoutMs),
+      ),
+    ]);
+
+    if (timedOut) {
+      try {
+        proc.kill();
+      } catch {}
+      return null;
+    }
+
+    const code = await proc.exited;
+    if (code !== 0 && chunks.length === 0) return null;
+    if (chunks.length === 0) return null;
+    return new Uint8Array(Buffer.concat(chunks));
   } catch {
     return null;
-  } finally {
-    try { unlinkSync(reqPath); } catch {}
-    try { unlinkSync(respPath); } catch {}
   }
 }
 
